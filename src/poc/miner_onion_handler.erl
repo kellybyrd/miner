@@ -28,7 +28,7 @@
 
 -include("miner_util.hrl").
 
--record(state, {peer :: undefined | libp2p_crypto:pubkey_bin()}).
+-record(state, {peer :: undefined | libp2p_crypto:pubkey_bin(), peer_addr}).
 
 %% ------------------------------------------------------------------
 %% API Function Definitions
@@ -47,7 +47,8 @@ send(Pid, Data) ->
 %% ------------------------------------------------------------------
 init(client, Conn, _Args) ->
     lager:info("started ~p client", [?MODULE]),
-    {ok, #state{peer=?IDENTIFY(Conn)}};
+    {_, PeerAddr} = libp2p_connection:addr_info(Conn),
+    {ok, #state{peer=?IDENTIFY(Conn), peer_addr=PeerAddr}};
 init(server, _Conn, _Args) ->
     lager:info("started ~p server", [?MODULE]),
     {ok, #state{}}.
@@ -55,10 +56,9 @@ init(server, _Conn, _Args) ->
 handle_data(client, Data, State) ->
     lager:info("client got data: ~p", [Data]),
     try blockchain_poc_response_v1:decode(Data) of
-        {witness, Witness} ->
-            ok = miner_poc_statem:witness(State#state.peer, Witness);
+        %% we should only get a receipt in this case
         {receipt, Receipt} ->
-            ok = miner_poc_statem:receipt(State#state.peer, Receipt)
+            ok = miner_poc_statem:receipt(State#state.peer, Receipt, State#state.peer_addr)
     catch _:_ ->
         lager:error("got unknown data ~p", [Data])
     end,
