@@ -76,7 +76,7 @@
     receipts_timeout = ?RECEIPTS_TIMEOUT :: non_neg_integer(),
     poc_restarts = ?POC_RESTARTS :: non_neg_integer(),
     txn_ref = make_ref() :: reference(),
-    addr_hash_filter :: undefined | {pos_integer(), pos_integer(), binary(), bloom_nif:bloom()}
+    addr_hash_filter :: undefined | {pos_integer(), pos_integer(), pos_integer(), binary(), bloom_nif:bloom()}
 }).
 
 -
@@ -313,12 +313,13 @@ receiving(cast, {witness, Address, Witness}, #data{responses=Responses0,
                     end
             end
     end;
-receiving(cast, {receipt, Address, Receipt, PeerAddr}, #data{responses=Responses0, challengees=Challengees}=Data) ->
+receiving(cast, {receipt, Address, Receipt, PeerAddr}, #data{responses=Responses0, challengees=Challengees, blockchain=Chain}=Data) ->
     lager:info("got receipt ~p", [Receipt]),
     Gateway = blockchain_poc_receipt_v1:gateway(Receipt),
     LayerData = blockchain_poc_receipt_v1:data(Receipt),
     LocationOK = miner_lora:location_ok(),
-    case {LocationOK, blockchain_poc_receipt_v1:is_valid(Receipt)} of
+    Ledger = blockchain:ledger(Chain),
+    case {LocationOK, blockchain_poc_receipt_v1:is_valid(Receipt, Ledger)} of
         {false, Valid} ->
             lager:warning("location is bad, validity: ~p", [Valid]),
             {keep_state, Data};
@@ -331,8 +332,17 @@ receiving(cast, {receipt, Address, Receipt, PeerAddr}, #data{responses=Responses
                 {Gateway, LayerData} ->
                     case maps:get(Gateway, Responses0, undefined) of
                         undefined ->
+                            IsFirstChallengee = case hd(Challengees) of
+                                                    {Gateway, _} ->
+                                                        true;
+                                                    _ ->
+                                                        false
+                                                end,
                             %% compute address hash and compare to known ones
                             case check_addr_hash(PeerAddr, Data) of
+                                true when IsFirstChallengee ->
+                                    %% drop whole challenge because we should always be able to get the first hop's receipt
+                                    {next_state, requesting, save_data(maybe_init_addr_hash(Data#data{state=requesting}))};
                                 true ->
                                     {keep_state, Data};
                                 undefined ->
@@ -632,89 +642,104 @@ maybe_init_addr_hash(#data{blockchain=undefined}=Data) ->
 maybe_init_addr_hash(#data{blockchain=Blockchain, addr_hash_filter=undefined}=Data) ->
     %% check if we have the block we need
     Ledger = blockchain:ledger(Blockchain),
-    case blockchain:config(?poc_challenge_interval, Ledger) of
-        {ok, Interval} ->
-            {ok, Height} = blockchain:height(Blockchain),
-            StartHeight = max(Height - (Height rem Interval), 1),
-            %% check if we have this block
-            case blockchain:get_block(StartHeight, Blockchain) of
-                {ok, Block} ->
-                    Hash = blockchain_block:hash_block(Block),
-                    %% ok, now we can build the filter
-                    Gateways = blockchain_ledger_v1:gateway_count(Ledger),
-                    {ok, Bloom} = bloom:new_optimal(Gateways, 1.0e-6),
-                    blockchain:fold_chain(fun(Blk, _) ->
-                                                  blockchain_utils:find_txn(Blk, fun(T) ->
-                                                                                    case blockchain_txn:type(T) == blockchain_txn_poc_receipts_v1 of
-                                                                                        true ->
-                                                                                            %% abuse side effects here for PERFORMANCE
-                                                                                            [ update_addr_hash(Bloom, E) ||  E <- blockchain_txn_poc_receipts_v1:path(T) ];
-                                                                                        false ->
-                                                                                            ok
-                                                                                    end,
-                                                                                    false
-                                                                            end),
-                                                  case Blk == Block of
-                                                      true ->
-                                                          return;
-                                                      false ->
-                                                          continue
-                                                  end
-                                          end, any, element(2, blockchain:head_block(Blockchain)), Blockchain),
-                    Data#data{addr_hash_filter={StartHeight, Height, Hash, Bloom}};
+    case blockchain:config(?poc_addr_hash_bytes, Ledger) of
+        {ok, Bytes} when is_integer(Bytes), Bytes > 0 ->
+            case blockchain:config(?poc_challenge_interval, Ledger) of
+                {ok, Interval} ->
+                    {ok, Height} = blockchain:height(Blockchain),
+                    StartHeight = max(Height - (Height rem Interval), 1),
+                    %% check if we have this block
+                    case blockchain:get_block(StartHeight, Blockchain) of
+                        {ok, Block} ->
+                            Hash = blockchain_block:hash_block(Block),
+                            %% ok, now we can build the filter
+                            Gateways = blockchain_ledger_v1:gateway_count(Ledger),
+                            {ok, Bloom} = bloom:new_optimal(Gateways, 1.0e-6),
+                            blockchain:fold_chain(fun(Blk, _) ->
+                                                          blockchain_utils:find_txn(Blk, fun(T) ->
+                                                                                                 case blockchain_txn:type(T) == blockchain_txn_poc_receipts_v1 of
+                                                                                                     true ->
+                                                                                                         %% abuse side effects here for PERFORMANCE
+                                                                                                         [ update_addr_hash(Bloom, E) ||  E <- blockchain_txn_poc_receipts_v1:path(T) ];
+                                                                                                     false ->
+                                                                                                         ok
+                                                                                                 end,
+                                                                                                 false
+                                                                                         end),
+                                                          case Blk == Block of
+                                                              true ->
+                                                                  return;
+                                                              false ->
+                                                                  continue
+                                                          end
+                                                  end, any, element(2, blockchain:head_block(Blockchain)), Blockchain),
+                            lager:info("initialized filter"),
+                            Data#data{addr_hash_filter={StartHeight, Height, Bytes, Hash, Bloom}};
+                        _ ->
+                            lager:info("cant get block ~p", [StartHeight]),
+                            Data
+                    end;
                 _ ->
-                    lager:info("cant get block ~p", [StartHeight]),
+                    lager:info("no challenge interval"),
                     Data
             end;
         _ ->
-            lager:info("no challenge interval"),
-           Data
+            lager:info("no hash bytes size"),
+            Data
     end;
-maybe_init_addr_hash(#data{blockchain=Blockchain, addr_hash_filter={StartHeight, Height, Hash, Bloom}}=Data) ->
+maybe_init_addr_hash(#data{blockchain=Blockchain, addr_hash_filter={StartHeight, Height, Bytes, Hash, Bloom}}=Data) ->
     Ledger = blockchain:ledger(Blockchain),
-    case blockchain:config(?poc_challenge_interval, Ledger) of
-        {ok, Interval} ->
-            {ok, CurHeight} = blockchain:height(Blockchain),
-            case Height - (Height rem Interval) of
-                StartHeight ->
-                    case CurHeight of
-                        Height ->
-                            %% ok, everything lines up
-                            Data;
-                        _ ->
-                            case blockchain:get_block(Height, Blockchain) of
-                                {ok, Block} ->
-                                    blockchain:fold_chain(fun(Blk, _) ->
-                                                                  blockchain_utils:find_txn(Blk, fun(T) ->
-                                                                                                    case blockchain_txn:type(T) == blockchain_txn_poc_receipts_v1 of
-                                                                                                        true ->
-                                                                                                            %% abuse side effects here for PERFORMANCE
-                                                                                                            [ update_addr_hash(Bloom, E) ||  E <- blockchain_txn_poc_receipts_v1:path(T) ];
-                                                                                                        false ->
-                                                                                                            ok
-                                                                                                    end,
-                                                                                                    false
-                                                                                            end),
-                                                                  case Blk == Block of
-                                                                      true ->
-                                                                          return;
-                                                                      false ->
-                                                                          continue
-                                                                  end
-                                                          end, any, element(2, blockchain:head_block(Blockchain)), Blockchain),
-                                    Data#data{addr_hash_filter={StartHeight, CurHeight, Hash, Bloom}};
+    case blockchain:config(?poc_addr_hash_bytes, Ledger) of
+        {ok, Bytes} when is_integer(Bytes), Bytes > 0 ->
+            case blockchain:config(?poc_challenge_interval, Ledger) of
+                {ok, Interval} ->
+                    {ok, CurHeight} = blockchain:height(Blockchain),
+                    case max(Height - (Height rem Interval), 1) of
+                        StartHeight ->
+                            case CurHeight of
+                                Height ->
+                                    %% ok, everything lines up
+                                    Data;
                                 _ ->
-                                    lager:info("cant get block ~p", [Height]),
-                                    Data
-                            end
+                                    case blockchain:get_block(Height, Blockchain) of
+                                        {ok, Block} ->
+                                            blockchain:fold_chain(fun(Blk, _) ->
+                                                                          blockchain_utils:find_txn(Blk, fun(T) ->
+                                                                                                                 case blockchain_txn:type(T) == blockchain_txn_poc_receipts_v1 of
+                                                                                                                     true ->
+                                                                                                                         %% abuse side effects here for PERFORMANCE
+                                                                                                                         [ update_addr_hash(Bloom, E) ||  E <- blockchain_txn_poc_receipts_v1:path(T) ];
+                                                                                                                     false ->
+                                                                                                                         ok
+                                                                                                                 end,
+                                                                                                                 false
+                                                                                                         end),
+                                                                          case Blk == Block of
+                                                                              true ->
+                                                                                  return;
+                                                                              false ->
+                                                                                  continue
+                                                                          end
+                                                                  end, any, element(2, blockchain:head_block(Blockchain)), Blockchain),
+                                            lager:info("updated filter"),
+                                            Data#data{addr_hash_filter={StartHeight, CurHeight, Bytes, Hash, Bloom}};
+                                        _ ->
+                                            lager:info("cant get block ~p", [Height]),
+                                            Data
+                                    end
+                            end;
+                        NewStart ->
+                            lager:info("Reinitializing filter ~p -> ~p", [StartHeight, NewStart]),
+                            %% filter is stale
+                            maybe_init_addr_hash(Data#data{addr_hash_filter=undefined})
                     end;
                 _ ->
-                    %% filter is stale
-                    maybe_init_addr_hash(Data#data{addr_hash_filter=undefined})
+                    lager:info("no challenge interval"),
+                    Data
             end;
         _ ->
-            lager:info("no challenge interval"),
-            Data
+            lager:info("no hash bytes size"),
+            Data#data{addr_hash_filter=undefined}
     end.
 
 update_addr_hash(Bloom, Element) ->
@@ -733,21 +758,22 @@ update_addr_hash(Bloom, Element) ->
 
 serialize_addr_hash_filter(undefined) ->
     undefined;
-serialize_addr_hash_filter({StartHeight, CurrentHeight, Hash, Bloom}) ->
-    {StartHeight, CurrentHeight, Hash, bloom:serialize(Bloom)}.
+serialize_addr_hash_filter({StartHeight, CurrentHeight, Size, Hash, Bloom}) ->
+    {StartHeight, CurrentHeight, Size, Hash, bloom:serialize(Bloom)}.
 
 deserialize_addr_hash_filter(undefined) ->
     undefined;
-deserialize_addr_hash_filter({StartHeight, CurrentHeight, Hash, Bloom}) ->
-    {StartHeight, CurrentHeight, Hash,  bloom:deserialize(Bloom)}.
+deserialize_addr_hash_filter({StartHeight, CurrentHeight, Size, Hash, Bloom}) ->
+    {StartHeight, CurrentHeight, Size, Hash,  bloom:deserialize(Bloom)}.
 
 check_addr_hash(_PeerAddr, #data{addr_hash_filter=undefined}) ->
+    lager:info("no filter"),
     undefined;
-check_addr_hash(PeerAddr, #data{addr_hash_filter={Start, Height, Hash, Bloom}}) ->
+check_addr_hash(PeerAddr, #data{addr_hash_filter={Start, Height, Size, Hash, Bloom}}) ->
     case multiaddr:protocols(PeerAddr) of
         [{"ip4",Address},{_,_}] ->
             {ok, Addr} = inet:parse_ipv4_address(Address),
-            Val = enacl:pwhash(list_to_binary(tuple_to_list(Addr)), binary:part(Hash, {0, enacl:pwhash_SALTBYTES()})),
+            Val = binary:part(enacl:pwhash(list_to_binary(tuple_to_list(Addr)), binary:part(Hash, {0, enacl:pwhash_SALTBYTES()})), {0, Size}),
             case bloom:check_and_set(Bloom, Val) of
                 true ->
                     lager:info("~p filtering peer ~p ~p", [{Start, Height}, PeerAddr, Val]),
