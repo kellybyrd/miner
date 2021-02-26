@@ -46,7 +46,7 @@ send(Pid, Data) ->
 %% libp2p_framed_stream Function Definitions
 %% ------------------------------------------------------------------
 init(client, _Conn, _Args) ->
-    {ok, #state{peer=?IDENTIFY(_Conn)}};
+    {ok, #state{}};
 init(server, Conn, _Args) ->
     {_, PeerAddr} = libp2p_connection:addr_info(Conn),
     {ok, #state{peer=?IDENTIFY(Conn), peer_addr=PeerAddr}}.
