@@ -56,6 +56,14 @@
 -define(BLOCK_PROPOGATION_TIME, timer:seconds(120)).
 -endif.
 
+-record(addr_hash_filter, {
+          start :: pos_integer(),
+          height :: pos_integer(),
+          byte_size :: pos_integer(),
+          salt :: binary(),
+          bloom :: bloom_nif:bloom()
+         }).
+
 -record(data, {
     base_dir :: file:filename_all() | undefined,
     blockchain :: blockchain:blockchain() | undefined,
@@ -76,7 +84,7 @@
     receipts_timeout = ?RECEIPTS_TIMEOUT :: non_neg_integer(),
     poc_restarts = ?POC_RESTARTS :: non_neg_integer(),
     txn_ref = make_ref() :: reference(),
-    addr_hash_filter :: undefined | {pos_integer(), pos_integer(), pos_integer(), binary(), bloom_nif:bloom()}
+    addr_hash_filter :: undefined | #addr_hash_filter{}
 }).
 
 -
@@ -655,26 +663,8 @@ maybe_init_addr_hash(#data{blockchain=Blockchain, addr_hash_filter=undefined}=Da
                             %% ok, now we can build the filter
                             Gateways = blockchain_ledger_v1:gateway_count(Ledger),
                             {ok, Bloom} = bloom:new_optimal(Gateways, 1.0e-6),
-                            blockchain:fold_chain(fun(Blk, _) ->
-                                                          blockchain_utils:find_txn(Blk, fun(T) ->
-                                                                                                 case blockchain_txn:type(T) == blockchain_txn_poc_receipts_v1 of
-                                                                                                     true ->
-                                                                                                         %% abuse side effects here for PERFORMANCE
-                                                                                                         [ update_addr_hash(Bloom, E) ||  E <- blockchain_txn_poc_receipts_v1:path(T) ];
-                                                                                                     false ->
-                                                                                                         ok
-                                                                                                 end,
-                                                                                                 false
-                                                                                         end),
-                                                          case Blk == Block of
-                                                              true ->
-                                                                  return;
-                                                              false ->
-                                                                  continue
-                                                          end
-                                                  end, any, element(2, blockchain:head_block(Blockchain)), Blockchain),
-                            lager:info("initialized filter"),
-                            Data#data{addr_hash_filter={StartHeight, Height, Bytes, Hash, Bloom}};
+                            sync_filter(Block, Bloom, Blockchain),
+                            Data#data{addr_hash_filter=#addr_hash_filter{start=StartHeight, height=Height, byte_size=Bytes, salt=Hash, bloom=Bloom}};
                         _ ->
                             lager:info("cant get block ~p", [StartHeight]),
                             Data
@@ -687,7 +677,7 @@ maybe_init_addr_hash(#data{blockchain=Blockchain, addr_hash_filter=undefined}=Da
             lager:info("no hash bytes size"),
             Data
     end;
-maybe_init_addr_hash(#data{blockchain=Blockchain, addr_hash_filter={StartHeight, Height, Bytes, Hash, Bloom}}=Data) ->
+maybe_init_addr_hash(#data{blockchain=Blockchain, addr_hash_filter=#addr_hash_filter{start=StartHeight, height=Height, byte_size=Bytes, salt=Hash, bloom=Bloom}}=Data) ->
     Ledger = blockchain:ledger(Blockchain),
     case blockchain:config(?poc_addr_hash_bytes, Ledger) of
         {ok, Bytes} when is_integer(Bytes), Bytes > 0 ->
@@ -703,44 +693,43 @@ maybe_init_addr_hash(#data{blockchain=Blockchain, addr_hash_filter={StartHeight,
                                 _ ->
                                     case blockchain:get_block(Height, Blockchain) of
                                         {ok, Block} ->
-                                            blockchain:fold_chain(fun(Blk, _) ->
-                                                                          blockchain_utils:find_txn(Blk, fun(T) ->
-                                                                                                                 case blockchain_txn:type(T) == blockchain_txn_poc_receipts_v1 of
-                                                                                                                     true ->
-                                                                                                                         %% abuse side effects here for PERFORMANCE
-                                                                                                                         [ update_addr_hash(Bloom, E) ||  E <- blockchain_txn_poc_receipts_v1:path(T) ];
-                                                                                                                     false ->
-                                                                                                                         ok
-                                                                                                                 end,
-                                                                                                                 false
-                                                                                                         end),
-                                                                          case Blk == Block of
-                                                                              true ->
-                                                                                  return;
-                                                                              false ->
-                                                                                  continue
-                                                                          end
-                                                                  end, any, element(2, blockchain:head_block(Blockchain)), Blockchain),
-                                            lager:info("updated filter"),
-                                            Data#data{addr_hash_filter={StartHeight, CurHeight, Bytes, Hash, Bloom}};
+                                            sync_filter(Block, Bloom, Blockchain),
+                                            Data#data{addr_hash_filter=#addr_hash_filter{start=StartHeight, height=CurHeight, byte_size=Bytes, salt=Hash, bloom=Bloom}};
                                         _ ->
-                                            lager:info("cant get block ~p", [Height]),
                                             Data
                                     end
                             end;
-                        NewStart ->
-                            lager:info("Reinitializing filter ~p -> ~p", [StartHeight, NewStart]),
+                        _NewStart ->
                             %% filter is stale
                             maybe_init_addr_hash(Data#data{addr_hash_filter=undefined})
                     end;
                 _ ->
-                    lager:info("no challenge interval"),
                     Data
             end;
         _ ->
-            lager:info("no hash bytes size"),
             Data#data{addr_hash_filter=undefined}
     end.
+
+sync_filter(StopBlock, Bloom, Blockchain) ->
+    blockchain:fold_chain(fun(Blk, _) ->
+                                  blockchain_utils:find_txn(Blk, fun(T) ->
+                                                                         case blockchain_txn:type(T) == blockchain_txn_poc_receipts_v1 of
+                                                                             true ->
+                                                                                 %% abuse side effects here for PERFORMANCE
+                                                                                 [ update_addr_hash(Bloom, E) ||  E <- blockchain_txn_poc_receipts_v1:path(T) ];
+                                                                             false ->
+                                                                                 ok
+                                                                         end,
+                                                                         false
+                                                                 end),
+                                  case Blk == StopBlock of
+                                      true ->
+                                          return;
+                                      false ->
+                                          continue
+                                  end
+                          end, any, element(2, blockchain:head_block(Blockchain)), Blockchain).
+
 
 update_addr_hash(Bloom, Element) ->
     case blockchain_poc_path_element_v1:receipt(Element) of
@@ -758,28 +747,26 @@ update_addr_hash(Bloom, Element) ->
 
 serialize_addr_hash_filter(undefined) ->
     undefined;
-serialize_addr_hash_filter({StartHeight, CurrentHeight, Size, Hash, Bloom}) ->
-    {StartHeight, CurrentHeight, Size, Hash, bloom:serialize(Bloom)}.
+serialize_addr_hash_filter(Filter=#addr_hash_filter{bloom=Bloom}) ->
+    Filter#addr_hash_filter{bloom=bloom:serialize(Bloom)}.
 
 deserialize_addr_hash_filter(undefined) ->
     undefined;
-deserialize_addr_hash_filter({StartHeight, CurrentHeight, Size, Hash, Bloom}) ->
-    {StartHeight, CurrentHeight, Size, Hash,  bloom:deserialize(Bloom)}.
+deserialize_addr_hash_filter(Filter=#addr_hash_filter{bloom=Bloom}) ->
+    Filter#addr_hash_filter{bloom=bloom:deserialize(Bloom)}.
 
 check_addr_hash(_PeerAddr, #data{addr_hash_filter=undefined}) ->
     lager:info("no filter"),
     undefined;
-check_addr_hash(PeerAddr, #data{addr_hash_filter={Start, Height, Size, Hash, Bloom}}) ->
+check_addr_hash(PeerAddr, #data{addr_hash_filter=#addr_hash_filter{byte_size=Size, salt=Hash, bloom=Bloom}}) ->
     case multiaddr:protocols(PeerAddr) of
         [{"ip4",Address},{_,_}] ->
             {ok, Addr} = inet:parse_ipv4_address(Address),
             Val = binary:part(enacl:pwhash(list_to_binary(tuple_to_list(Addr)), binary:part(Hash, {0, enacl:pwhash_SALTBYTES()})), {0, Size}),
             case bloom:check_and_set(Bloom, Val) of
                 true ->
-                    lager:info("~p filtering peer ~p ~p", [{Start, Height}, PeerAddr, Val]),
                     true;
                 false ->
-                    lager:info("~p allowing peer ~p ~p", [{Start, Height}, PeerAddr, Val]),
                     Val
             end;
         _ ->
