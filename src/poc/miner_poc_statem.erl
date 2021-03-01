@@ -730,6 +730,7 @@ sync_filter(StopBlock, Bloom, Blockchain) ->
                           end, any, element(2, blockchain:head_block(Blockchain)), Blockchain).
 
 
+-spec update_addr_hash(Bloom :: bloom_nif:bloom(), Element :: blockchain_poc_path_element_v1:poc_element()) -> ok.
 update_addr_hash(Bloom, Element) ->
     case blockchain_poc_path_element_v1:receipt(Element) of
         undefined ->
