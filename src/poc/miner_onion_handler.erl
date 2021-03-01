@@ -28,7 +28,10 @@
 
 -include("miner_util.hrl").
 
--record(state, {peer :: undefined | libp2p_crypto:pubkey_bin(), peer_addr}).
+-record(state,
+    { peer :: undefined | libp2p_crypto:pubkey_bin(),
+      peer_addr :: undefined | string()
+     }).
 
 %% ------------------------------------------------------------------
 %% API Function Definitions
