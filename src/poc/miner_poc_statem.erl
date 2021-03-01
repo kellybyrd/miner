@@ -49,6 +49,7 @@
 -define(RECEIPTS_TIMEOUT, 10).
 -define(STATE_FILE, "miner_poc_statem.state").
 -define(POC_RESTARTS, 3).
+-define(ADDR_HASH_FP_RATE, 1.0e-6).
 
 -ifdef(TEST).
 -define(BLOCK_PROPOGATION_TIME, timer:seconds(1)).
@@ -349,7 +350,7 @@ receiving(cast, {receipt, Address, Receipt, PeerAddr}, #data{responses=Responses
                             case check_addr_hash(PeerAddr, Data) of
                                 true when IsFirstChallengee ->
                                     %% drop whole challenge because we should always be able to get the first hop's receipt
-                                    {next_state, requesting, save_data(maybe_init_addr_hash(Data#data{state=requesting}))};
+                                    {next_state, requesting, save_data(Data#data{state=requesting})};
                                 true ->
                                     {keep_state, Data};
                                 undefined ->
@@ -661,7 +662,7 @@ maybe_init_addr_hash(#data{blockchain=Blockchain, addr_hash_filter=undefined}=Da
                             Hash = blockchain_block:hash_block(Block),
                             %% ok, now we can build the filter
                             Gateways = blockchain_ledger_v1:gateway_count(Ledger),
-                            {ok, Bloom} = bloom:new_optimal(Gateways, 1.0e-6),
+                            {ok, Bloom} = bloom:new_optimal(Gateways, ?ADDR_HASH_FP_RATE),
                             sync_filter(Block, Bloom, Blockchain),
                             Data#data{addr_hash_filter=#addr_hash_filter{start=StartHeight, height=Height, byte_size=Bytes, salt=Hash, bloom=Bloom}};
                         _ ->
