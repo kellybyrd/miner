@@ -87,8 +87,7 @@
     addr_hash_filter :: undefined | #addr_hash_filter{}
 }).
 
--
-type state() :: requesting | mining | receiving | waiting.
+-type state() :: requesting | mining | receiving | waiting.
 -type data() :: #data{}.
 -type keys() :: #{secret => libp2p_crypto:privkey(), public => libp2p_crypto:pubkey()}.
 
