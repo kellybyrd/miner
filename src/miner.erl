@@ -449,9 +449,13 @@ handle_call({create_block, Metadata, Txns, HBBFTRound}, _From, State) ->
                             Epoch = ElectionEpoch0 + 1,
                             Start = EpochStart0 + 1,
                             End = CurrentBlockHeight,
-                            {ok, Rewards} = blockchain_txn_rewards_v1:calculate_rewards(Start, End, Chain),
-                            lager:debug("Rewards: ~p~n", [Rewards]),
-                            RewardsTxn = blockchain_txn_rewards_v1:new(Start, End, Rewards),
+                            RewardsMod = case blockchain:config(?rewards_txn_version, Ledger) of
+                                                2 -> blockchain_txn_rewards_v2;
+                                                _ -> blockchain_txn_rewards_v1
+                                            end,
+                            {ok, Rewards} = RewardsMod:calculate_rewards(Start, End, Chain),
+                            lager:debug("RewardsMod: ~p, Rewards: ~p~n", [RewardsMod, Rewards]),
+                            RewardsTxn = RewardsMod:new(Start, End, Rewards),
                             %% to cut down on the size of group txn blocks, which we'll
                             %% need to fetch and store all of to validate snapshots, we
                             %% discard all other txns for this block
